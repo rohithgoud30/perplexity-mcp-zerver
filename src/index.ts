@@ -450,3 +450,133 @@ class PerplexityMCPServer {
       throw error;
     }
   }
+
+  private async setupBrowserEvasion() {
+    if (!this.page) return;
+    await this.page.evaluateOnNewDocument(() => {
+      // Overwrite navigator properties to help avoid detection
+      Object.defineProperties(navigator, {
+        webdriver: { get: () => undefined },
+        hardwareConcurrency: { get: () => 8 },
+        deviceMemory: { get: () => 8 },
+        platform: { get: () => 'Win32' },
+        languages: { get: () => ['en-US', 'en'] },
+        permissions: {
+          get: () => ({
+            query: async () => ({ state: 'prompt' })
+          })
+        }
+      });
+      // Inject Chrome-specific properties
+      window.chrome = {
+        app: {
+          InstallState: {
+            DISABLED: 'disabled',
+            INSTALLED: 'installed',
+            NOT_INSTALLED: 'not_installed'
+          },
+          RunningState: {
+            CANNOT_RUN: 'cannot_run',
+            READY_TO_RUN: 'ready_to_run',
+            RUNNING: 'running'
+          },
+          getDetails: function () {},
+          getIsInstalled: function () {},
+          installState: function () {},
+          isInstalled: false,
+          runningState: function () {}
+        },
+        runtime: {
+          OnInstalledReason: {
+            CHROME_UPDATE: 'chrome_update',
+            INSTALL: 'install',
+            SHARED_MODULE_UPDATE: 'shared_module_update',
+            UPDATE: 'update'
+          },
+          PlatformArch: {
+            ARM: 'arm',
+            ARM64: 'arm64',
+            MIPS: 'mips',
+            MIPS64: 'mips64',
+            X86_32: 'x86-32',
+            X86_64: 'x86-64'
+          },
+          PlatformNaclArch: {
+            ARM: 'arm',
+            MIPS: 'mips',
+            PNACL: 'pnacl',
+            X86_32: 'x86-32',
+            X86_64: 'x86-64'
+          },
+          PlatformOs: {
+            ANDROID: 'android',
+            CROS: 'cros',
+            LINUX: 'linux',
+            MAC: 'mac',
+            OPENBSD: 'openbsd',
+            WIN: 'win'
+          },
+          RequestUpdateCheckStatus: {
+            NO_UPDATE: 'no_update',
+            THROTTLED: 'throttled',
+            UPDATE_AVAILABLE: 'update_available'
+          }
+        }
+      };
+    });
+  }
+
+  private async waitForSearchInput(
+    timeout = CONFIG.SELECTOR_TIMEOUT
+  ): Promise<string | null> {
+    if (!this.page) return null;
+    const possibleSelectors = [
+      'textarea[placeholder*="Ask"]',
+      'textarea[placeholder*="Search"]',
+      'textarea.w-full',
+      'textarea[rows="1"]',
+      '[role="textbox"]',
+      'textarea'
+    ];
+    for (const selector of possibleSelectors) {
+      try {
+        const element = await this.page.waitForSelector(selector, {
+          timeout: 5000,
+          visible: true
+        });
+        if (element) {
+          const isInteractive = await this.page.evaluate((sel) => {
+            const el = document.querySelector(sel);
+            return el && !el.hasAttribute('disabled') && el.getAttribute('aria-hidden') !== 'true';
+          }, selector);
+          if (isInteractive) {
+            safeLog(`Found working search input: ${selector}`);
+            this.searchInputSelector = selector;
+            return selector;
+          }
+        }
+      } catch (error) {
+        logWarn(`Selector '${selector}' not found or not interactive`);
+      }
+    }
+    // Take a screenshot for debugging if none is found
+    await this.page.screenshot({ path: 'debug_search_not_found.png', fullPage: true });
+    logError('No working search input found');
+    return null;
+  }
+
+  private async checkForCaptcha(): Promise<boolean> {
+    if (!this.page) return false;
+    const captchaIndicators = [
+      '[class*="captcha"]',
+      '[id*="captcha"]',
+      'iframe[src*="captcha"]',
+      'iframe[src*="recaptcha"]',
+      'iframe[src*="turnstile"]',
+      '#challenge-running',
+      '#challenge-form'
+    ];
+    return await this.page.evaluate((selectors) => {
+      return selectors.some((selector) => !!document.querySelector(selector));
+    }, captchaIndicators);
+  }

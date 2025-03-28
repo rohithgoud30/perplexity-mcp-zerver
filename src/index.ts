@@ -580,3 +580,154 @@ class PerplexityMCPServer {
       return selectors.some((selector) => !!document.querySelector(selector));
     }, captchaIndicators);
   }
+
+  private determineRecoveryLevel(error?: Error): number {
+    if (!error) return 3; // Default to full restart if no error info
+    
+    const errorMsg = error.message.toLowerCase();
+    if (errorMsg.includes('frame') || errorMsg.includes('detached')) {
+      return 2; // New page for frame issues
+    }
+    if (errorMsg.includes('timeout') || errorMsg.includes('navigation')) {
+      return 1; // Refresh for timeouts/navigation
+    }
+    return 3; // Full restart for other errors
+  }
+
+  private async recoveryProcedure(error?: Error) {
+    const recoveryLevel = this.determineRecoveryLevel(error);
+    const opId = ++this.operationCount;
+    
+    safeLog('Starting recovery procedure');
+
+    try {
+      switch(recoveryLevel) {
+        case 1: // Page refresh
+          safeLog('Attempting page refresh');
+          if (this.page) {
+            await this.page.reload({timeout: CONFIG.TIMEOUT_PROFILES.navigation});
+          }
+          break;
+          
+        case 2: // New page
+          safeLog('Creating new page instance');
+          if (this.page) {
+            await this.page.close();
+          }
+          if (this.browser) {
+            this.page = await this.browser.newPage();
+            await this.setupBrowserEvasion();
+            await this.page.setViewport({ width: 1920, height: 1080 });
+            await this.page.setUserAgent(CONFIG.USER_AGENT);
+          }
+          break;
+          
+        case 3: // Full restart
+        default:
+          safeLog('Performing full browser restart');
+          if (this.page) {
+            await this.page.close();
+          }
+          if (this.browser) {
+            await this.browser.close();
+          }
+          this.page = null;
+          this.browser = null;
+          await new Promise(resolve => setTimeout(resolve, CONFIG.RECOVERY_WAIT_TIME));
+          await this.initializeBrowser();
+          break;
+      }
+      
+      safeLog('Recovery completed');
+    } catch (recoveryError) {
+      logError('Recovery failed:', recoveryError);
+      
+      // Fall back to more aggressive recovery if initial attempt fails
+      if (recoveryLevel < 3) {
+        safeLog('Attempting higher level recovery');
+        await this.recoveryProcedure(new Error('Fallback recovery'));
+      } else {
+        throw recoveryError;
+      }
+    }
+  }
+
+  private log(level: 'info'|'error'|'warn', message: string) {
+    if (level === 'info') {
+      safeLog(message);
+    } else if (level === 'error') {
+      logError(message);
+    } else if (level === 'warn') {
+      logWarn(message);
+    }
+  }
+
+  private resetIdleTimeout() {
+    if (this.idleTimeout) {
+      clearTimeout(this.idleTimeout);
+    }
+
+    this.idleTimeout = setTimeout(async () => {
+      safeLog('Browser idle timeout reached, closing browser...');
+      try {
+        if (this.page) {
+          await this.page.close();
+          this.page = null;
+        }
+        if (this.browser) {
+          await this.browser.close();
+          this.browser = null;
+        }
+        this.isInitializing = false; // Reset initialization flag
+        safeLog('Browser cleanup completed successfully');
+      } catch (error) {
+        logError('Error during browser cleanup:', error);
+        // Reset states even if cleanup fails
+        this.page = null;
+        this.browser = null;
+        this.isInitializing = false;
+      }
+    }, this.IDLE_TIMEOUT_MS);
+  }
+
+  private async retryOperation<T>(
+    operation: () => Promise<T>,
+    maxRetries = CONFIG.MAX_RETRIES
+  ): Promise<T> {
+    let lastError: Error | null = null;
+    let consecutiveTimeouts = 0;
+    let consecutiveNavigationErrors = 0;
+    
+    for (let i = 0; i < maxRetries; i++) {
+      try {
+        safeLog(`Attempt ${i + 1}/${maxRetries}...`);
+        const result = await operation();
+        // Reset counters on success
+        consecutiveTimeouts = 0;
+        consecutiveNavigationErrors = 0;
+        return result;
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+        logError(`Attempt ${i + 1} failed:`, error);
+        
+        // Exit early if we've reached the max retries
+        if (i === maxRetries - 1) {
+          logError(`Maximum retry attempts (${maxRetries}) reached. Giving up.`);
+          break;
+        }
+        
+        // Check for specific error conditions
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        const isTimeoutError = errorMsg.includes('timeout') || errorMsg.includes('Timed out');
+        const isNavigationError = errorMsg.includes('navigation') || errorMsg.includes('Navigation');
+        const isConnectionError = errorMsg.includes('net::') || errorMsg.includes('connection') || errorMsg.includes('network');
+        const isProtocolError = errorMsg.includes('Protocol error');
+        
+        // If CAPTCHA is detected, try to recover immediately
+        if (await this.checkForCaptcha()) {
+          logError('CAPTCHA detected! Initiating recovery...');
+          await this.recoveryProcedure();
+          // Add a small delay after recovery
+          await new Promise((resolve) => setTimeout(resolve, 3000));
+          continue;
+        }

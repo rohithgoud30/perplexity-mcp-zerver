@@ -825,3 +825,22 @@ class PerplexityMCPServer {
     
     throw new Error('Failed to complete search after retries');
   }
+
+  // ─── SERVER START METHOD ───────────────────────────────────────────────
+  async start() {
+    await this.server.listen(new StdioServerTransport());
+    safeLog('MCP Server started');
+  }
+}
+
+// ─── STARTUP CODE ───────────────────────────────────────────────────────
+try {
+  const mcpServer = new PerplexityMCPServer();
+  mcpServer.start().catch((error) => {
+    logError('Failed to start server:', error);
+    process.exit(1);
+  });
+} catch (error) {
+  logError('Fatal error during initialization:', error);
+  process.exit(1);
+}

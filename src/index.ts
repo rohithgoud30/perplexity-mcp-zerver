@@ -588,3 +588,240 @@ class PerplexityMCPServer {
       }
     }, this.IDLE_TIMEOUT_MS);
   }
+
+  // ─── TOOL HANDLERS ────────────────────────────────────────────────────
+
+  private setupToolHandlers() {
+    this.server.registerListToolsHandler(async (params) => {
+      safeLog('Received list tools request');
+      this.resetIdleTimeout();
+    
+      return {
+        tools: [
+          {
+            name: 'perplexity_web_search',
+            description: 'Search for information across the web using the Perplexity AI search engine',
+            authorizationType: 'none',
+            schema: {
+              type: 'object',
+              properties: {
+                query: {
+                  type: 'string',
+                  description: 'The search query to look up'
+                }
+              },
+              required: ['query']
+            }
+          }
+        ]
+      };
+    });
+
+    this.server.registerCallToolHandler(async (params, info) => {
+      safeLog('Received call tool request:', params.name);
+      this.resetIdleTimeout();
+      
+      if (params.name !== 'perplexity_web_search') {
+        throw new McpError(
+          ErrorCode.InvalidArgument,
+          `Tool not found: ${params.name}`
+        );
+      }
+      
+      if (!params.params?.query) {
+        throw new McpError(
+          ErrorCode.InvalidArgument, 
+          'Missing required parameter: query'
+        );
+      }
+      
+      const chatId = info.callId ?? crypto.randomUUID();
+      const query = params.params.query;
+      
+      // Create the user message
+      const userMessage: ChatMessage = {
+        role: 'user',
+        content: query
+      };
+      
+      // Look up chat history
+      const chatHistory = this.getChatHistory(chatId);
+      
+      // If it's not a continuation, create a new message
+      if (chatHistory.length === 0) {
+        this.saveChatMessage(chatId, userMessage);
+      }
+      
+      try {
+        const result = await this.performSearch(query);
+        
+        // Save assistant message to the database
+        const assistantMessage: ChatMessage = {
+          role: 'assistant',
+          content: result
+        };
+        this.saveChatMessage(chatId, assistantMessage);
+        
+        return {
+          result: result
+        };
+      } catch (error) {
+        logError('Error performing search:', error);
+        throw new McpError(
+          ErrorCode.Internal,
+          'Error performing search: ' + (error instanceof Error ? error.message : String(error))
+        );
+      }
+    });
+  }
+
+  // ─── PERPLEXITY SEARCH ────────────────────────────────────────────────
+
+  private async performSearch(query: string): Promise<string> {
+    if (!this.browser || !this.page) {
+      safeLog('Browser not initialized, starting setup...');
+      await this.initializeBrowser();
+    }
+    
+    if (!this.page) throw new Error('Page not initialized after setup attempt');
+    
+    // Rate limiting
+    const now = Date.now();
+    const timeSinceLastSearch = now - this.lastSearchTime;
+    if (timeSinceLastSearch < CONFIG.SEARCH_COOLDOWN) {
+      const waitTime = CONFIG.SEARCH_COOLDOWN - timeSinceLastSearch;
+      safeLog(`Rate limiting: waiting ${waitTime}ms before next search`);
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+    }
+    this.lastSearchTime = Date.now();
+
+    let retryCount = 0;
+    while (retryCount <= CONFIG.MAX_RETRIES) {
+      try {
+        safeLog(`Executing search query: "${query}" (attempt ${retryCount + 1})`);
+        
+        // Check for captcha first
+        const hasCaptcha = await this.checkForCaptcha();
+        if (hasCaptcha) {
+          logWarn('Captcha detected, attempting recovery');
+          await this.recoveryProcedure(new Error('Captcha detected'));
+          retryCount++;
+          continue;
+        }
+        
+        // Find and interact with the search input
+        safeLog('Locating search input');
+        const inputSelector = await this.waitForSearchInput();
+        if (!inputSelector) {
+          logWarn('Search input not found, attempting recovery');
+          await this.recoveryProcedure(new Error('Search input not found'));
+          retryCount++;
+          continue;
+        }
+
+        // Clear the input field
+        safeLog('Clearing previous search input');
+        await this.page.evaluate((selector) => {
+          const element = document.querySelector(selector);
+          if (element) {
+            (element as HTMLTextAreaElement).value = '';
+          }
+        }, inputSelector);
+        
+        // Type the search query
+        safeLog('Typing search query');
+        await this.page.type(inputSelector, query);
+        
+        // Press Enter to submit
+        safeLog('Submitting search query');
+        await this.page.keyboard.press('Enter');
+        
+        // Wait for the answer
+        safeLog('Waiting for answer');
+        
+        // Define selectors to detect different answer states
+        const answerSelectors = [
+          '.prose', // Common content container
+          '[data-answer-id]', // Answer element 
+          '.text-token-text-primary p', // Text content
+          '.markdown-content', // Markdown formatted answers
+        ];
+        
+        // Wait for the search to complete (detect any answer element)
+        const answerSelector = answerSelectors.join(', ');
+        await this.page.waitForSelector(answerSelector, {
+          timeout: CONFIG.ANSWER_WAIT_TIMEOUT,
+          visible: true,
+        });
+        
+        // Wait additional time to ensure the answer is fully generated
+        safeLog('Answer element found, waiting for completion');
+        
+        // Look for a "Stop" button that indicates generation is in progress
+        let isGenerating = true;
+        const startWaitTime = Date.now();
+        const checkInterval = 1000; // Check every second
+        
+        while (isGenerating && (Date.now() - startWaitTime < CONFIG.ANSWER_WAIT_TIMEOUT)) {
+          // Check if there's a stop button or other generating indicators
+          isGenerating = await this.page.evaluate(() => {
+            const stopButton = document.querySelector('button[aria-label="Stop"]') || 
+                               document.querySelector('button:contains("Stop")') ||
+                               document.querySelector('.animate-pulse');
+            return !!stopButton;
+          });
+          
+          if (!isGenerating) {
+            safeLog('Answer generation complete');
+            break;
+          }
+          
+          safeLog('Waiting for answer generation to complete...');
+          await new Promise(resolve => setTimeout(resolve, checkInterval));
+        }
+        
+        // Wait a bit more to ensure everything is rendered
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+        // Extract the final answer
+        safeLog('Extracting answer content');
+        const answerContent = await this.page.evaluate((selectors) => {
+          // Try each selector in order of specificity
+          for (const selector of selectors) {
+            const elements = Array.from(document.querySelectorAll(selector));
+            if (elements.length > 0) {
+              // Get the text from all matching elements
+              return elements.map(el => el.textContent || '').join('\n\n');
+            }
+          }
+          // Fallback: capture any text that might be relevant
+          return document.body.innerText;
+        }, answerSelectors);
+        
+        // Clean up the answer text
+        const cleanedAnswer = answerContent
+          .replace(/^\s+|\s+$/g, '') // Trim whitespace
+          .replace(/\n{3,}/g, '\n\n') // Normalize multiple newlines
+          .replace(/\s{2,}/g, ' '); // Normalize multiple spaces
+          
+        safeLog('Search completed successfully');
+        return cleanedAnswer;
+        
+      } catch (error) {
+        logError(`Search attempt ${retryCount + 1} failed:`, error);
+        
+        // Determine if we need to recover the browser
+        if (retryCount < CONFIG.MAX_RETRIES) {
+          logWarn(`Retrying (${retryCount + 1}/${CONFIG.MAX_RETRIES})...`);
+          await this.recoveryProcedure(error instanceof Error ? error : undefined);
+        } else {
+          logError('Max retries exceeded');
+          throw new Error('Failed to perform search after multiple attempts');
+        }
+        
+        retryCount++;
+      }
+    }
+    
+    throw new Error('Failed to complete search after retries');
+  }
